@@ -1,0 +1,37 @@
+#pragma once
+
+#include <string>
+
+namespace ServerRuntime
+{
+	enum EServerLogLevel
+	{
+		eServerLogLevel_Debug = 0,
+		eServerLogLevel_Info = 1,
+		eServerLogLevel_Warn = 2,
+		eServerLogLevel_Error = 3
+	};
+
+	void SetServerLogLevel(EServerLogLevel level);
+	EServerLogLevel GetServerLogLevel();
+
+	void LogDebug(const char *category, const char *message);
+	void LogInfo(const char *category, const char *message);
+	void LogWarn(const char *category, const char *message);
+	void LogError(const char *category, const char *message);
+
+	/** Emit formatted log output with the specified level and category */
+	void LogDebugf(const char *category, const char *format, ...);
+	void LogInfof(const char *category, const char *format, ...);
+	void LogWarnf(const char *category, const char *format, ...);
+	void LogErrorf(const char *category, const char *format, ...);
+
+	void LogStartupStep(const char *message);
+	void LogWorldIO(const char *message);
+	void LogWorldName(const char *prefix, const std::wstring &name);
+
+	// When true, noisy [perf] sampling output (histograms, per-iter samples)
+	// is enabled. Threshold-fired warnings remain always-on. Toggled via the
+	// -perftrace CLI flag.
+	extern bool g_serverPerfTrace;
+}

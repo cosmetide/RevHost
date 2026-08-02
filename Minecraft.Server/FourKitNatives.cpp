@@ -1,0 +1,1965 @@
+#include "FourKitNatives.h"
+#include "FourKitBridge.h"
+#include "Common/StringUtils.h"
+#include "stdafx.h"
+
+#include <atomic>
+#include <string>
+#include <vector>
+
+#include "../Minecraft.Client/MinecraftServer.h"
+#include "../Minecraft.Client/PlayerConnection.h"
+#include "../Minecraft.Client/PlayerList.h"
+#include "../Minecraft.Client/ServerConnection.h"
+#include "../Minecraft.Client/ServerLevel.h"
+#include "../Minecraft.Client/ServerPlayer.h"
+#include "../Minecraft.Client/ServerPlayerGameMode.h"
+#include "../Minecraft.Client/ServerChunkCache.h"
+#include "../Minecraft.World/LevelChunk.h"
+#include "../Minecraft.World/Biome.h"
+#include "../Minecraft.World/LightLayer.h"
+#include "../Minecraft.Client/Windows64/Network/WinsockNetLayer.h"
+#include "../Minecraft.World/AbstractContainerMenu.h"
+#include "../Minecraft.World/AddGlobalEntityPacket.h"
+#include "../Minecraft.World/ArrayWithLength.h"
+#include "../Minecraft.World/Class.h"
+#include "../Minecraft.World/CompoundContainer.h"
+#include "../Minecraft.World/Connection.h"
+#include "../Minecraft.World/DamageSource.h"
+#include "../Minecraft.World/Explosion.h"
+#include "../Minecraft.World/ItemEntity.h"
+#include "../Minecraft.World/ItemInstance.h"
+#include "../Minecraft.World/LevelData.h"
+#include "../Minecraft.World/LightningBolt.h"
+#include "../Minecraft.World/Player.h"
+#include "../Minecraft.World/PlayerAbilitiesPacket.h"
+#include "../Minecraft.World/SetCarriedItemPacket.h"
+#include "../Minecraft.World/BlockRegionUpdatePacket.h"
+#include "../Minecraft.World/SetExperiencePacket.h"
+#include "../Minecraft.World/SetHealthPacket.h"
+#include "../Minecraft.World/LevelSoundPacket.h"
+#include "../Minecraft.World/LevelParticlesPacket.h"
+#include "../Minecraft.Client/ParticleType.h"
+#include "../Minecraft.World/SetEntityLinkPacket.h"
+#include "../Minecraft.World/SimpleContainer.h"
+#include "../Minecraft.World/Slot.h"
+#include "../Minecraft.World/Tile.h"
+#include "../Minecraft.World/net.minecraft.world.entity.player.h"
+#include "Access/Access.h"
+#include "Common/NetworkUtils.h"
+#include "ServerLogManager.h"
+#include "../Minecraft.World/Recipes.h"
+#include "../Minecraft.World/ItemInstance.cpp"
+#include <mutex>
+
+namespace
+{
+
+std::atomic<uint32_t> g_handlerMask{0};
+
+static shared_ptr<ServerPlayer> FindPlayer(int entityId)
+{
+    PlayerList *list = MinecraftServer::getPlayerList();
+    if (!list)
+        return nullptr;
+    for (auto &p : list->players)
+    {
+        if (p && p->entityId == entityId)
+            return p;
+    }
+    return nullptr;
+}
+
+static bool IsHostPlayer(const shared_ptr<ServerPlayer>& player)
+{
+    return player && player->connection && player->connection->isLocal();
+}
+
+static shared_ptr<Entity> FindEntity(int entityId)
+{
+    MinecraftServer *srv = MinecraftServer::getInstance();
+    if (!srv)
+        return nullptr;
+    const int dims[] = {0, -1, 1};
+    for (int dim : dims)
+    {
+        ServerLevel *level = srv->getLevel(dim);
+        if (!level)
+            continue;
+        shared_ptr<Entity> entity = level->getEntity(entityId);
+        if (entity)
+            return entity;
+    }
+    return nullptr;
+}
+
+static ServerLevel *GetLevel(int dimId)
+{
+    MinecraftServer *srv = MinecraftServer::getInstance();
+    if (!srv)
+        return nullptr;
+    return srv->getLevel(dimId);
+}
+
+class VirtualContainer : public SimpleContainer
+{
+    int m_containerType;
+
+  public:
+    VirtualContainer(int containerType, const std::wstring &name, int size)
+        : SimpleContainer(0, name, !name.empty(), size), m_containerType(containerType)
+    {
+    }
+    virtual int getContainerType() override
+    {
+        return m_containerType;
+    }
+};
+
+}
+
+class NativeFourKitTask;
+
+static int64_t STATIC_lastTick = -1;
+static std::unordered_map<int, std::shared_ptr<NativeFourKitTask>> _taskCache;
+static std::mutex _taskMutex;
+
+class NativeFourKitTask {
+public:
+    int startDelay;
+    int runCooldown;
+
+    int lastRunTick;
+
+    NativeFourKitTask(int _startDelay, int _runCooldown) : startDelay(_startDelay), runCooldown(_runCooldown), lastRunTick(-1) {};
+};
+
+namespace FourKitBridge
+{
+
+void __cdecl NativeSetHandlerMask(uint32_t mask)
+{
+    g_handlerMask.store(mask, std::memory_order_release);
+}
+
+bool HasHandlers(int kind)
+{
+    if (kind < 0 || kind >= 32) return false;
+    return (g_handlerMask.load(std::memory_order_acquire) & (1u << kind)) != 0;
+}
+
+int __cdecl NativeGetServerTickCount()
+{
+    MinecraftServer *srv = MinecraftServer::getInstance();
+    return srv ? srv->tickCount : 0;
+}
+
+void __cdecl NativeAddScheduler(int taskid, int startDelay, int runCooldown)
+{
+    std::lock_guard<std::mutex> g(_taskMutex);
+    _taskCache.emplace(taskid, std::make_shared<NativeFourKitTask>(startDelay, runCooldown));
+}
+
+void __cdecl NativeRemoveScheduler(int taskid)
+{
+    std::lock_guard<std::mutex> g(_taskMutex);
+    auto it = _taskCache.find(taskid);
+
+    if (it != _taskCache.end()) {
+        _taskCache.erase(it);
+    }
+}
+
+void NativeServerTickCallback(int currentTick)
+{
+    bool callManagedFunction = false;
+
+    if (STATIC_lastTick == -1) {
+        callManagedFunction = true;
+        STATIC_lastTick = currentTick;
+    }
+
+    {
+        std::lock_guard<std::mutex> g(_taskMutex);
+        for (const auto& [taskid, task] : _taskCache)
+        {
+            NativeFourKitTask* taskPointer = task.get();
+            if (taskPointer->startDelay > 0) {
+                taskPointer->startDelay -= (currentTick - STATIC_lastTick);
+
+                if (taskPointer->startDelay <= 0) {
+                    callManagedFunction = true; //make c# update the tasks so its not queued anymore but now its running
+                    taskPointer->startDelay = 0; //ensure it stays 0
+                }
+                continue;
+            }
+
+            int lastTaskTick = taskPointer->lastRunTick;
+            if (lastTaskTick == -1 || (lastTaskTick + taskPointer->runCooldown) <= currentTick) {
+                callManagedFunction = true;
+                taskPointer->lastRunTick = currentTick;
+            }
+        }
+    }
+
+    if (callManagedFunction) FireSchedulerCallback(currentTick);
+    STATIC_lastTick = currentTick;
+}
+
+void __cdecl NativeAddRecipe(unsigned char* recipeData)
+{
+    int offset = 0;
+    char recipeType = recipeData[offset]; offset += 1;
+
+    if (recipeType == 0x1) { //shapeless recipe
+        unsigned char recipeGroup = recipeData[offset]; offset += 1;
+        unsigned char ingredientsCount = recipeData[offset]; offset += 1;
+
+        std::vector<ItemInstance*>* ingredients = new std::vector<ItemInstance*>();
+        for (int i = 0; i < ingredientsCount; i++) {
+            ingredients->emplace_back(Transformation_ReadItemFromBuffer_CStyle(recipeData, offset));
+        }
+
+        ItemInstance* result = Transformation_ReadItemFromBuffer_CStyle(recipeData, offset);
+        Recipes::getInstance()->addShapelessRecipy(result, ingredients, (int)recipeGroup);
+    }
+
+    //Recipes::addShapelessRecipy
+
+    if (recipeType == 0x1 || recipeType == 0x2) {
+        MinecraftServer* server = MinecraftServer::getInstance(); if (server == nullptr) return;
+        PlayerList* playerList = server->getPlayerList(); if (playerList == nullptr) return;
+
+        for (int i = 0; i < playerList->players.size(); i++) {
+            std::shared_ptr<ServerPlayer> player = playerList->players[i];
+            if (player == nullptr || player->connection == nullptr) continue; // this shouldnt happen
+
+            player->connection->send(Recipes::getInstance()->createUpdatePacket());
+        }
+    }
+}
+
+void __cdecl NativeDamagePlayer(int entityId, float amount)
+{
+    auto player = FindPlayer(entityId);
+    if (IsHostPlayer(player))
+        return;
+    if (player)
+    {
+        player->hurt(DamageSource::genericSource, amount);
+        return;
+    }
+    auto entity = FindEntity(entityId);
+    if (entity)
+    {
+        entity->hurt(DamageSource::genericSource, amount);
+    }
+}
+
+void __cdecl NativeSetPlayerHealth(int entityId, float health)
+{
+    auto player = FindPlayer(entityId);
+    if (IsHostPlayer(player))
+        return;
+    if (player)
+    {
+        player->setHealth(health);
+    }
+}
+
+void __cdecl NativeTeleportPlayer(int entityId, double x, double y, double z)
+{
+    auto player = FindPlayer(entityId);
+    if (IsHostPlayer(player))
+        return;
+    if (player && player->connection)
+    {
+        double outX, outY, outZ;
+        bool cancelled = FirePlayerTeleport(entityId,
+                                            player->x, player->y, player->z, player->dimension,
+                                            x, y, z, player->dimension,
+                                            2 /* PLUGIN */,
+                                            &outX, &outY, &outZ);
+        if (!cancelled)
+        {
+            player->connection->teleport(outX, outY, outZ, player->yRot, player->xRot);
+        }
+    }
+}
+
+void __cdecl NativeSetPlayerGameMode(int entityId, int gameMode)
+{
+    auto player = FindPlayer(entityId);
+    if (IsHostPlayer(player))
+        return;
+    if (player && player->gameMode)
+    {
+        GameType *type = GameType::byId(gameMode);
+        if (type)
+        {
+            player->setGameMode(type);
+        }
+    }
+}
+
+void __cdecl NativeBroadcastMessage(const char *utf8, int len)
+{
+    if (!utf8 || len <= 0)
+        return;
+    std::wstring wide = ServerRuntime::StringUtils::Utf8ToWide(utf8);
+    if (wide.empty())
+        return;
+    PlayerList *list = MinecraftServer::getPlayerList();
+    if (list)
+    {
+        list->broadcastAll(std::make_shared<ChatPacket>(wide));
+    }
+}
+
+void __cdecl NativeSetFallDistance(int entityId, float distance)
+{
+    auto player = FindPlayer(entityId);
+    if (IsHostPlayer(player))
+        return;
+    if (player)
+    {
+        player->fallDistance = distance;
+    }
+}
+
+// double[27] = { x, y, z, health, maxHealth, fallDistance, gameMode, walkSpeed, yaw, pitch, dimension, isSleeping, sleepTimer, sneaking, sprinting, onGround, velocityX, velocityY, velocityZ, allowFlight, sleepingIgnored, experienceLevel, experienceProgress, totalExperience, foodLevel, saturation, exhaustion }
+void __cdecl NativeGetPlayerSnapshot(int entityId, double *outData)
+{
+    auto player = FindPlayer(entityId);
+    if (!player)
+    {
+        memset(outData, 0, 27 * sizeof(double));
+        outData[3] = 20.0;
+        outData[4] = 20.0;
+        outData[7] = 0.1;
+        outData[24] = 20.0;
+        outData[25] = 5.0;
+        return;
+    }
+    outData[0] = player->x;
+    outData[1] = player->y;
+    outData[2] = player->z;
+    outData[3] = (double)player->getHealth();
+    outData[4] = (double)player->getMaxHealth();
+    outData[5] = (double)player->fallDistance;
+    GameType *gm = player->gameMode ? player->gameMode->getGameModeForPlayer() : GameType::SURVIVAL;
+    outData[6] = (double)(gm ? gm->getId() : 0);
+    outData[7] = (double)player->abilities.getWalkingSpeed();
+    outData[8] = (double)player->yRot;
+    outData[9] = (double)player->xRot;
+    outData[10] = (double)player->dimension;
+    outData[11] = player->isSleeping() ? 1.0 : 0.0;
+    outData[12] = (double)player->getSleepTimer();
+    outData[13] = player->isSneaking() ? 1.0 : 0.0;
+    outData[14] = player->isSprinting() ? 1.0 : 0.0;
+    outData[15] = player->onGround ? 1.0 : 0.0;
+    outData[16] = player->xd;
+    outData[17] = player->yd;
+    outData[18] = player->zd;
+    outData[19] = player->abilities.mayfly ? 1.0 : 0.0;
+    outData[20] = player->fk_sleepingIgnored ? 1.0 : 0.0;
+    outData[21] = (double)player->experienceLevel;
+    outData[22] = (double)player->experienceProgress;
+    outData[23] = (double)player->totalExperience;
+    FoodData *fd = player->getFoodData();
+    outData[24] = fd ? (double)fd->getFoodLevel() : 20.0;
+    outData[25] = fd ? (double)fd->getSaturationLevel() : 5.0;
+    outData[26] = fd ? (double)fd->getExhaustionLevel() : 0.0;
+}
+
+void __cdecl NativeSendMessage(int entityId, const char *utf8, int len)
+{
+    if (!utf8 || len <= 0)
+        return;
+    auto player = FindPlayer(entityId);
+    if (IsHostPlayer(player))
+        return;
+    if (player && player->connection)
+    {
+        std::wstring wide = ServerRuntime::StringUtils::Utf8ToWide(utf8);
+        if (!wide.empty())
+        {
+            player->connection->send(std::make_shared<ChatPacket>(wide));
+        }
+    }
+}
+
+void __cdecl NativeSetWalkSpeed(int entityId, float speed)
+{
+    auto player = FindPlayer(entityId);
+    if (IsHostPlayer(player))
+        return;
+    if (player)
+    {
+        player->abilities.setWalkingSpeed(speed);
+        if (player->connection)
+        {
+            player->connection->send(std::make_shared<PlayerAbilitiesPacket>(&player->abilities));
+        }
+    }
+}
+
+void __cdecl NativeTeleportEntity(int entityId, int dimId, double x, double y, double z)
+{
+    auto player = FindPlayer(entityId);
+    if (IsHostPlayer(player))
+        return;
+    if (player && player->connection)
+    {
+        double outX = x, outY = y, outZ = z;
+        bool cancelled = FirePlayerTeleport(entityId, 
+            player->x, player->y, player->z, player->dimension,
+            x, y, z, dimId,
+            2 /* PLUGIN */,
+            &outX, &outY, &outZ
+        );
+
+        if (!cancelled)
+        {
+            if (dimId != player->dimension)
+            {
+                MinecraftServer::getInstance()->getPlayers()->toggleDimension(player, dimId);
+            }
+            player->connection->teleport(outX, outY, outZ, player->yRot, player->xRot);
+        }
+        return;
+    }
+    ServerLevel *level = GetLevel(dimId);
+    if (!level)
+        return;
+    shared_ptr<Entity> entity = level->getEntity(entityId);
+    if (entity)
+    {
+        entity->moveTo(x, y, z, entity->yRot, entity->xRot);
+    }
+}
+
+int __cdecl NativeGetTileId(int dimId, int x, int y, int z)
+{
+    ServerLevel *level = GetLevel(dimId);
+    if (!level)
+        return 0;
+    return level->getTile(x, y, z);
+}
+
+int __cdecl NativeGetTileData(int dimId, int x, int y, int z)
+{
+    ServerLevel *level = GetLevel(dimId);
+    if (!level)
+        return 0;
+    return level->getData(x, y, z);
+}
+
+void __cdecl NativeSetTile(int dimId, int x, int y, int z, int tileId, int data, int flags)
+{
+    ServerLevel *level = GetLevel(dimId);
+    if (!level)
+        return;
+    level->setTileAndData(x, y, z, tileId, data, flags);
+}
+
+void __cdecl NativeSetTileData(int dimId, int x, int y, int z, int data, int flags)
+{
+    ServerLevel *level = GetLevel(dimId);
+    if (!level)
+        return;
+    level->setData(x, y, z, data, flags);
+}
+
+int __cdecl NativeBreakBlock(int dimId, int x, int y, int z)
+{
+    ServerLevel *level = GetLevel(dimId);
+    if (!level)
+        return 0;
+    if (level->getTile(x, y, z) == 0)
+        return 0;
+    return level->destroyTile(x, y, z, true) ? 1 : 0;
+}
+
+int __cdecl NativeGetHighestBlockY(int dimId, int x, int z)
+{
+    ServerLevel *level = GetLevel(dimId);
+    if (!level)
+        return 0;
+    return level->getHeightmap(x, z);
+}
+
+// double[7] = { spawnX, spawnY, spawnZ, seed, dayTime, isRaining, isThundering }
+void __cdecl NativeGetWorldInfo(int dimId, double *outBuf)
+{
+    ServerLevel *level = GetLevel(dimId);
+    if (!level)
+    {
+        memset(outBuf, 0, 7 * sizeof(double));
+        return;
+    }
+    LevelData *ld = level->getLevelData();
+    Pos *spawn = level->getSharedSpawnPos();
+    outBuf[0] = spawn ? (double)spawn->x : 0.0;
+    outBuf[1] = spawn ? (double)spawn->y : 64.0;
+    outBuf[2] = spawn ? (double)spawn->z : 0.0;
+    outBuf[3] = (double)level->getSeed();
+    outBuf[4] = (double)level->getDayTime();
+    outBuf[5] = ld && ld->isRaining() ? 1.0 : 0.0;
+    outBuf[6] = ld && ld->isThundering() ? 1.0 : 0.0;
+}
+
+void __cdecl NativeSetWorldTime(int dimId, int64_t time)
+{
+    ServerLevel *level = GetLevel(dimId);
+    if (!level)
+        return;
+    level->setDayTime(time);
+}
+
+void __cdecl NativeSetWeather(int dimId, int storm, int thundering, int thunderDuration)
+{
+    ServerLevel *level = GetLevel(dimId);
+    if (!level)
+        return;
+    LevelData *ld = level->getLevelData();
+    if (!ld)
+        return;
+    if (storm >= 0)
+        ld->setRaining(storm != 0);
+    if (thundering >= 0)
+        ld->setThundering(thundering != 0);
+    if (thunderDuration >= 0)
+        ld->setThunderTime(thunderDuration);
+}
+
+int __cdecl NativeCreateExplosion(int dimId, double x, double y, double z, float power, int setFire, int breakBlocks)
+{
+    ServerLevel *level = GetLevel(dimId);
+    if (!level)
+        return 0;
+    Explosion explosion(level, nullptr, x, y, z, power);
+    explosion.fire = (setFire != 0);
+    explosion.destroyBlocks = (breakBlocks != 0);
+    explosion.explode();
+    explosion.finalizeExplosion(true);
+    return 1;
+}
+
+int __cdecl NativeStrikeLightning(int dimId, double x, double y, double z, int effectOnly)
+{
+    ServerLevel *level = GetLevel(dimId);
+    if (!level)
+        return 0;
+
+    std::shared_ptr<Entity> lightning = std::shared_ptr<Entity>(new LightningBolt(level, x, y, z));
+
+    if (effectOnly != 0)
+    {
+        PlayerList *playerList = MinecraftServer::getPlayerList();
+        if (playerList == NULL)
+            return 0;
+        playerList->broadcast(x, y, z, 512.0, dimId, std::shared_ptr<Packet>(new AddGlobalEntityPacket(lightning)));
+        level->playSound(x, y, z, eSoundType_AMBIENT_WEATHER_THUNDER, 10000, 0.8f + level->random->nextFloat() * 0.2f);
+        level->playSound(x, y, z, eSoundType_RANDOM_EXPLODE, 2, 0.5f + level->random->nextFloat() * 0.2f);
+        return 1;
+    }
+
+    return level->addGlobalEntity(lightning) ? 1 : 0;
+}
+
+int __cdecl NativeSetSpawnLocation(int dimId, int x, int y, int z)
+{
+    ServerLevel *level = GetLevel(dimId);
+    if (!level)
+        return 0;
+    level->setSpawnPos(x, y, z);
+    return 1;
+}
+
+void __cdecl NativeDropItem(int dimId, double x, double y, double z, unsigned char* itemData, int naturally)
+{
+    ServerLevel *level = GetLevel(dimId);
+    if (!level)
+        return;
+    
+    int offset = 0;
+    auto itemInstance = Transformation_ReadItemFromBuffer(itemData, offset);
+    if (itemInstance == nullptr) return;
+
+    double spawnX = x, spawnY = y, spawnZ = z;
+    if (naturally)
+    {
+        float s = 0.7f;
+        spawnX += level->random->nextFloat() * s + (1 - s) * 0.5;
+        spawnY += level->random->nextFloat() * s + (1 - s) * 0.5;
+        spawnZ += level->random->nextFloat() * s + (1 - s) * 0.5;
+    }
+
+    auto item = std::make_shared<ItemEntity>(level, spawnX, spawnY, spawnZ, itemInstance);
+    item->throwTime = 10;
+    level->addEntity(item);
+}
+
+void __cdecl NativeKickPlayer(int entityId, int reason)
+{
+    auto player = FindPlayer(entityId);
+    if (IsHostPlayer(player))
+        return;
+    if (player && player->connection)
+    {
+        DisconnectPacket::eDisconnectReason r = static_cast<DisconnectPacket::eDisconnectReason>(reason);
+        player->connection->disconnect(r);
+    }
+}
+
+int __cdecl NativeBanPlayer(int entityId, const char *reasonUtf8, int reasonByteLen)
+{
+    if (!ServerRuntime::Access::IsInitialized())
+        return 0;
+
+    auto player = FindPlayer(entityId);
+    if (!player)
+        return 0;
+
+    if (IsHostPlayer(player))
+        return 0;
+
+    std::vector<PlayerUID> xuids;
+    PlayerUID xuid1 = player->getXuid();
+    PlayerUID xuid2 = player->getOnlineXuid();
+    if (xuid1 != INVALID_XUID)
+        xuids.push_back(xuid1);
+    if (xuid2 != INVALID_XUID && xuid2 != xuid1)
+        xuids.push_back(xuid2);
+
+    if (xuids.empty())
+        return 0;
+
+    std::string reason = (reasonUtf8 && reasonByteLen > 0) ? std::string(reasonUtf8, reasonByteLen) : "Banned by plugin.";
+    std::string playerName = ServerRuntime::StringUtils::WideToUtf8(player->getName());
+
+    ServerRuntime::Access::BanMetadata metadata = ServerRuntime::Access::BanManager::BuildDefaultMetadata("Plugin");
+    metadata.reason = reason;
+
+    for (auto xuid : xuids)
+    {
+        if (!ServerRuntime::Access::IsPlayerBanned(xuid))
+            ServerRuntime::Access::AddPlayerBan(xuid, playerName, metadata);
+    }
+
+    if (player->connection)
+        player->connection->disconnect(DisconnectPacket::eDisconnect_Banned);
+
+    return 1;
+}
+
+int __cdecl NativeBanPlayerIp(int entityId, const char *reasonUtf8, int reasonByteLen)
+{
+    if (!ServerRuntime::Access::IsInitialized())
+        return 0;
+
+    auto player = FindPlayer(entityId);
+    if (!player || !player->connection || !player->connection->connection || !player->connection->connection->getSocket())
+        return 0;
+
+    if (IsHostPlayer(player))
+        return 0;
+
+    unsigned char smallId = player->connection->connection->getSocket()->getSmallId();
+    if (smallId == 0)
+        return 0;
+
+    std::string playerIp;
+    if (!ServerRuntime::ServerLogManager::TryGetConnectionRemoteIp(smallId, &playerIp))
+        return 0;
+
+    std::string reason = (reasonUtf8 && reasonByteLen > 0) ? std::string(reasonUtf8, reasonByteLen) : "Banned by plugin.";
+
+    ServerRuntime::Access::BanMetadata metadata = ServerRuntime::Access::BanManager::BuildDefaultMetadata("Plugin");
+    metadata.reason = reason;
+
+    std::string normalizedIp = ServerRuntime::NetworkUtils::NormalizeIpToken(playerIp);
+    if (ServerRuntime::Access::IsIpBanned(normalizedIp))
+        return 0;
+
+    if (!ServerRuntime::Access::AddIpBan(normalizedIp, metadata))
+        return 0;
+
+    PlayerList *list = MinecraftServer::getPlayerList();
+    if (list)
+    {
+        std::vector<std::shared_ptr<ServerPlayer>> snapshot = list->players;
+        for (auto &p : snapshot)
+        {
+            if (!p || !p->connection || !p->connection->connection || !p->connection->connection->getSocket())
+                continue;
+            unsigned char sid = p->connection->connection->getSocket()->getSmallId();
+            if (sid == 0)
+                continue;
+            std::string pIp;
+            if (!ServerRuntime::ServerLogManager::TryGetConnectionRemoteIp(sid, &pIp))
+                continue;
+            if (ServerRuntime::NetworkUtils::NormalizeIpToken(pIp) == normalizedIp)
+            {
+                if (p->connection)
+                    p->connection->disconnect(DisconnectPacket::eDisconnect_Banned);
+            }
+        }
+    }
+
+    return 1;
+}
+
+int __cdecl NativeGetPlayerAddress(int entityId, char *outIpBuf, int outIpBufSize, int *outPort)
+{
+    if (outPort)
+        *outPort = 0;
+    if (outIpBuf && outIpBufSize > 0)
+        outIpBuf[0] = '\0';
+
+    auto player = FindPlayer(entityId);
+    if (!player || !player->connection || !player->connection->connection || !player->connection->connection->getSocket())
+        return 0;
+
+    unsigned char smallId = player->connection->connection->getSocket()->getSmallId();
+    if (smallId == 0)
+        return 0;
+
+    std::string playerIp;
+    if (!ServerRuntime::ServerLogManager::TryGetConnectionRemoteIp(smallId, &playerIp))
+    {
+        SOCKET sock = WinsockNetLayer::GetSocketForSmallId(smallId);
+        if (sock != INVALID_SOCKET)
+        {
+            sockaddr_in addr;
+            int addrLen = sizeof(addr);
+            if (getpeername(sock, (sockaddr *)&addr, &addrLen) == 0)
+            {
+                char ipBuf[64] = {};
+                if (inet_ntop(AF_INET, &addr.sin_addr, ipBuf, sizeof(ipBuf)))
+                {
+                    playerIp = ipBuf;
+                    if (outPort)
+                        *outPort = (int)ntohs(addr.sin_port);
+                }
+            }
+        }
+        if (playerIp.empty())
+            return 0;
+    }
+    else
+    {
+        SOCKET sock = WinsockNetLayer::GetSocketForSmallId(smallId);
+        if (sock != INVALID_SOCKET && outPort)
+        {
+            sockaddr_in addr;
+            int addrLen = sizeof(addr);
+            if (getpeername(sock, (sockaddr *)&addr, &addrLen) == 0)
+                *outPort = (int)ntohs(addr.sin_port);
+        }
+    }
+
+    if (outIpBuf && outIpBufSize > 0)
+    {
+        int copyLen = (int)playerIp.size();
+        if (copyLen >= outIpBufSize)
+            copyLen = outIpBufSize - 1;
+        memcpy(outIpBuf, playerIp.c_str(), copyLen);
+        outIpBuf[copyLen] = '\0';
+    }
+
+    return 1;
+}
+
+int __cdecl NativeGetPlayerLatency(int entityId)
+{
+    auto player = FindPlayer(entityId);
+    if (!player) return -1;
+
+    return player->latency;
+}
+
+int __cdecl NativeSendRaw(int entityId, unsigned char *bufferData, int bufferSize)
+{
+    auto player = FindPlayer(entityId);
+    if (IsHostPlayer(player)) return -1;
+    if (!player) return -1;
+
+    if (!player->connection || !player->connection->connection)
+        return -1;
+
+    player->connection->connection->send(bufferData, bufferSize);
+}
+
+void Transformation_WriteTagToBuffer(Tag* tag, unsigned char* outBuffer, int& offset) {
+    bool isNull = (tag == nullptr);
+
+    outBuffer[offset] = isNull; offset += 1;
+
+    if (isNull) return;
+
+    {
+        wstring tagString = tag->getName();
+        unsigned char tagLength = (tagString.length() & 0xFF);
+
+        outBuffer[offset] = tagLength; offset += 1;
+
+        for (wchar_t _char : tagString) {
+            unsigned short _castedChar = ((unsigned char)_char);
+
+            outBuffer[offset] = ((_castedChar >> 8) & 0xFF); offset += 1;
+            outBuffer[offset] = (_castedChar & 0xFF); offset += 1;
+        }
+    }
+
+    {
+        unsigned char tagType = tag->getId();
+        outBuffer[offset] = tagType; offset += 1;
+
+        if (tagType == Tag::TAG_Byte) {
+            unsigned char value = ((ByteTag*)tag)->data;
+
+            outBuffer[offset] = value; offset += 1;
+        } else if (tagType == Tag::TAG_Short) {
+            short value = ((ShortTag*)tag)->data;
+
+            outBuffer[offset] = ((value >> 8) & 0xFF); offset += 1;
+            outBuffer[offset] = (value & 0xFF); offset += 1;
+        } else if (tagType == Tag::TAG_Int) {
+            int value = ((IntTag*)tag)->data;
+
+            outBuffer[offset] = ((value >> 24) & 0xFF); offset += 1;
+            outBuffer[offset] = ((value >> 16) & 0xFF); offset += 1;
+            outBuffer[offset] = ((value >> 8) & 0xFF); offset += 1;
+            outBuffer[offset] = (value & 0xFF); offset += 1;
+        } else if (tagType == Tag::TAG_Long) {
+            long value = ((LongTag*)tag)->data;
+
+            outBuffer[offset] = ((value >> 56) & 0xFF); offset += 1;
+            outBuffer[offset] = ((value >> 48) & 0xFF); offset += 1;
+            outBuffer[offset] = ((value >> 40) & 0xFF); offset += 1;
+            outBuffer[offset] = ((value >> 32) & 0xFF); offset += 1;
+            outBuffer[offset] = ((value >> 24) & 0xFF); offset += 1;
+            outBuffer[offset] = ((value >> 16) & 0xFF); offset += 1;
+            outBuffer[offset] = ((value >> 8) & 0xFF); offset += 1;
+            outBuffer[offset] = (value & 0xFF); offset += 1;
+        } else if (tagType == Tag::TAG_Float) {
+            long value = (((FloatTag*)tag)->data * 32);
+
+            outBuffer[offset] = ((value >> 56) & 0xFF); offset += 1;
+            outBuffer[offset] = ((value >> 48) & 0xFF); offset += 1;
+            outBuffer[offset] = ((value >> 40) & 0xFF); offset += 1;
+            outBuffer[offset] = ((value >> 32) & 0xFF); offset += 1;
+            outBuffer[offset] = ((value >> 24) & 0xFF); offset += 1;
+            outBuffer[offset] = ((value >> 16) & 0xFF); offset += 1;
+            outBuffer[offset] = ((value >> 8) & 0xFF); offset += 1;
+            outBuffer[offset] = (value & 0xFF); offset += 1;
+        } else if (tagType == Tag::TAG_Double) {
+            long value = (((DoubleTag*)tag)->data * 32);
+
+            outBuffer[offset] = ((value >> 56) & 0xFF); offset += 1;
+            outBuffer[offset] = ((value >> 48) & 0xFF); offset += 1;
+            outBuffer[offset] = ((value >> 40) & 0xFF); offset += 1;
+            outBuffer[offset] = ((value >> 32) & 0xFF); offset += 1;
+            outBuffer[offset] = ((value >> 24) & 0xFF); offset += 1;
+            outBuffer[offset] = ((value >> 16) & 0xFF); offset += 1;
+            outBuffer[offset] = ((value >> 8) & 0xFF); offset += 1;
+            outBuffer[offset] = (value & 0xFF); offset += 1;
+        } else if (tagType == Tag::TAG_String) {
+            wstring value = ((StringTag*)tag)->data;
+            short length = ((short)value.length());
+
+            outBuffer[offset] = ((length >> 8) & 0xFF); offset += 1;
+            outBuffer[offset] = (length & 0xFF); offset += 1;
+
+            for (int i = 0; i < length; i++) {
+                unsigned short _castedChar = ((unsigned char)value[i]);
+
+                outBuffer[offset] = ((_castedChar >> 8) & 0xFF); offset += 1;
+                outBuffer[offset] = (_castedChar & 0xFF); offset += 1;
+            }
+        } else if (tagType == Tag::TAG_List) {
+            ListTag<Tag>* listTag = ((ListTag<Tag>*)tag);
+            short length = ((short)listTag->size());
+
+            outBuffer[offset] = ((length >> 8) & 0xFF); offset += 1;
+            outBuffer[offset] = (length & 0xFF); offset += 1;
+
+            for (int i = 0; i < length; i++) {
+                Transformation_WriteTagToBuffer(listTag->get(i), outBuffer, offset);
+            }
+        } else if (tagType == Tag::TAG_Compound) {
+            CompoundTag* compoundTag = ((CompoundTag*)tag);
+            std::vector<Tag*>* allTags = compoundTag->getAllTags();
+
+            short length = ((short)allTags->size());
+            outBuffer[offset] = ((length >> 8) & 0xFF); offset += 1;
+            outBuffer[offset] = (length & 0xFF); offset += 1;
+
+            for (int i = 0; i < length; i++) {
+                Transformation_WriteTagToBuffer((*allTags)[i], outBuffer, offset);
+            }
+
+            delete allTags;
+        }
+    }
+}
+
+Tag* Transformation_ReadTagFromBuffer(unsigned char* outBuffer, int& offset) {
+    bool isNull = outBuffer[offset]; offset += 1;
+    if (isNull != 0) return nullptr;
+
+    wstring tagName = L"";
+    {
+        unsigned char length = outBuffer[offset]; offset += 1;
+
+        for (int i = 0; i < length; i++) {
+            unsigned short value = ((outBuffer[offset] << 8) | outBuffer[offset + 1]); offset += 2;
+
+            tagName += (wchar_t)value;
+        }
+    }
+
+    {
+        unsigned char tagType = outBuffer[offset]; offset += 1;
+
+        if (tagType == Tag::TAG_Byte) {
+            unsigned char value = outBuffer[offset]; offset += 1;
+
+            return new ByteTag(tagName, value);
+        } else if (tagType == Tag::TAG_Short) {
+            unsigned short value = ((outBuffer[offset] << 8) | outBuffer[offset + 1]); offset += 2;
+
+            return new ShortTag(tagName, value);
+        } else if (tagType == Tag::TAG_Int) {
+            int value = 0;
+            value |= outBuffer[offset] << 24; offset += 1;
+            value |= outBuffer[offset] << 16; offset += 1;
+            value |= outBuffer[offset] << 8; offset += 1;
+            value |= outBuffer[offset]; offset += 1;
+
+            return new IntTag(tagName, value);
+        } else if (tagType == Tag::TAG_Long || tagType == Tag::TAG_Float || tagType == Tag::TAG_Double) {
+            int64_t value = 0;
+            value |= (int64_t)outBuffer[offset] << 56; offset += 1;
+            value |= (int64_t)outBuffer[offset] << 48; offset += 1;
+            value |= (int64_t)outBuffer[offset] << 40; offset += 1;
+            value |= (int64_t)outBuffer[offset] << 32; offset += 1;
+            value |= (int64_t)outBuffer[offset] << 24; offset += 1;
+            value |= (int64_t)outBuffer[offset] << 16; offset += 1;
+            value |= (int64_t)outBuffer[offset] << 8; offset += 1;
+            value |= (int64_t)outBuffer[offset]; offset += 1;
+
+            if (tagType == Tag::TAG_Long) {
+                return new LongTag(tagName, value);
+            } else if (tagType == Tag::TAG_Float) {
+                return new FloatTag(tagName, (value / 32));
+            } else if (tagType == Tag::TAG_Double) {
+                return new DoubleTag(tagName, (value / 32));
+            }
+
+        } else if (tagType == Tag::TAG_String) {
+            wstring value = L"";
+
+            short length = ((outBuffer[offset] << 8) | outBuffer[offset + 1]); offset += 2;
+
+            for (int i = 0; i < length; i++) {
+                unsigned short castedChar = ((outBuffer[offset] << 8) | outBuffer[offset + 1]); offset += 2;
+
+                value += (wchar_t)castedChar;
+            }
+
+            return new StringTag(tagName, value);
+        } else if (tagType == Tag::TAG_List) {
+            ListTag<Tag>* listTag = new ListTag<Tag>(tagName);
+            short length = ((outBuffer[offset] << 8) | outBuffer[offset + 1]); offset += 2;
+
+            for (int i = 0; i < length; i++) {
+                Tag* newTag = Transformation_ReadTagFromBuffer(outBuffer, offset);
+                if (newTag != nullptr) {
+                    listTag->add(newTag);
+                }
+            }
+
+            return listTag;
+        } else if (tagType == Tag::TAG_Compound) {
+            CompoundTag* compoundTag = new CompoundTag();
+            short length = ((outBuffer[offset] << 8) | outBuffer[offset + 1]); offset += 2;
+
+            for (int i = 0; i < length; i++) {
+                Tag* newTag = Transformation_ReadTagFromBuffer(outBuffer, offset);
+                if (newTag != nullptr) {
+                    compoundTag->put(newTag->getName(), newTag);
+                }
+            }
+
+            return compoundTag;
+        }
+    }
+
+    return nullptr;
+}
+
+void Transformation_WriteItemMetaToBuffer(std::shared_ptr<ItemInstance> item, unsigned char* outBuffer, int& offset) {
+    bool hasItemTag =  ((item != nullptr) && (item->tag != nullptr));
+    outBuffer[offset] = !hasItemTag; offset += 1;
+
+
+    if (hasItemTag) {
+        int metadataFlagsOffset = offset;
+        outBuffer[metadataFlagsOffset] = 0; offset += 1;
+
+        if (item->hasCustomHoverName()) {
+            outBuffer[metadataFlagsOffset] |= 0x1;
+            wstring customName = item->getHoverName();
+
+            outBuffer[offset] = ((customName.size() >> 8) & 0xFF); offset += 1;
+            outBuffer[offset] = (customName.size() & 0xFF); offset += 1;
+
+            for (wchar_t c : customName) {
+                outBuffer[offset] = ((c >> 8) & 0xFF); offset += 1;
+                outBuffer[offset] = (c & 0xFF); offset += 1;
+            }
+        }
+
+        CompoundTag* displayTag = item->getTag()->getCompound(L"display");
+
+        if (displayTag && displayTag->contains(L"Lore")) {
+            outBuffer[metadataFlagsOffset] |= 0x2;
+            ListTag<Tag>* loreList = displayTag->getList(L"Lore");
+
+            unsigned char loreCount = ((int)loreList->size()) & 0xFF;
+            outBuffer[offset] = loreCount; offset += 1;
+
+            for (int i = 0; i < loreCount; i++) {
+                StringTag* tag = (StringTag*)loreList->get(i);
+                wstring loreString = tag->data;
+                short loreStringLength = loreString.size();
+
+                outBuffer[offset] = ((loreStringLength >> 8) & 0xFF); offset += 1;
+                outBuffer[offset] = (loreStringLength & 0xFF); offset += 1;
+
+                for (wchar_t c : loreString) {
+                    outBuffer[offset] = ((c >> 8) & 0xFF); offset += 1;
+                    outBuffer[offset] = (c & 0xFF); offset += 1;
+                }
+            }
+        }
+
+        if (item->isEnchanted()) {
+            outBuffer[metadataFlagsOffset] |= 0x4;
+            ListTag<CompoundTag>* enchantmentTags = item->getEnchantmentTags();
+
+            unsigned char enchantmentCount = ((int)enchantmentTags->size()) & 0xFF;
+            outBuffer[offset] = enchantmentCount; offset += 1;
+
+            for (int i = 0; i < enchantmentCount; i++) {
+                CompoundTag* enchantment = enchantmentTags->get(i);
+                short enchantmentId = enchantment->getShort(ItemInstance::TAG_ENCH_ID);
+                short enchantmentLevel = enchantment->getShort(ItemInstance::TAG_ENCH_LEVEL);
+
+                outBuffer[offset] = ((enchantmentId >> 8) & 0xFF); offset += 1;
+                outBuffer[offset] = (enchantmentId & 0xFF); offset += 1;
+
+                outBuffer[offset] = ((enchantmentLevel >> 8) & 0xFF); offset += 1;
+                outBuffer[offset] = (enchantmentLevel & 0xFF); offset += 1;
+            }
+
+        }
+
+        CompoundTag* dataTag = item->getTag()->getCompound(L"fourkit-data");
+
+        if (dataTag != nullptr) {
+            outBuffer[metadataFlagsOffset] |= 0x8;
+
+            vector<Tag*>* allTags = dataTag->getAllTags();
+            short tagLength = (short)(allTags->size());
+
+            outBuffer[offset] = ((tagLength << 8) & 0xFF); offset += 1;
+            outBuffer[offset] = (tagLength & 0xFF); offset += 1;
+
+            for (int i = 0; i < tagLength; i++) {
+                Transformation_WriteTagToBuffer((*allTags)[i], outBuffer, offset);
+            }
+        }
+    }
+}
+
+void Transformation_ReadItemMetaFromBuffer(ItemInstance* item, unsigned char* itemData, int& offset) {
+    unsigned char isTagNull = itemData[offset]; offset += 1;
+
+    if (isTagNull == 0) {
+        if (item->tag == nullptr) item->tag = new CompoundTag();
+        uint8_t metadataFlags = itemData[offset]; offset += 1;
+
+        if (metadataFlags & 0x1) {
+            uint16_t customNameLength = (itemData[offset] << 8) | itemData[offset + 1]; offset += 2;
+            wstring customName;
+            for (int i = 0; i < customNameLength; i++) {
+                wchar_t c = (itemData[offset] << 8) | itemData[offset + 1]; offset += 2;
+                customName.push_back(c);
+            }
+            item->setHoverName(customName);
+        }
+
+        if (metadataFlags & 0x2) {
+            ListTag<Tag>* loreList = new ListTag<Tag>(L"Lore");
+
+            uint8_t loreCount = itemData[offset]; offset += 1;
+            for (int i = 0; i < loreCount; i++) {
+                uint16_t loreStringLength = (itemData[offset] << 8) | itemData[offset + 1]; offset += 2;
+                wstring loreString;
+                for (int j = 0; j < loreStringLength; j++) {
+                    wchar_t c = (itemData[offset] << 8) | itemData[offset + 1]; offset += 2;
+                    loreString.push_back(c);
+                }
+                loreList->add(new StringTag(L"", loreString));
+            }
+            if (item->tag->getCompound(L"display") == nullptr) {
+                item->tag->putCompound(L"display", new CompoundTag());
+            }
+            
+            item->tag->getCompound(L"display")->put(L"Lore", loreList);
+        }
+
+        if (metadataFlags & 0x4) {
+            ListTag<CompoundTag>* enchantmentTags = new ListTag<CompoundTag>(L"ench");
+
+            uint8_t enchantmentCount = itemData[offset]; offset += 1;
+            for (int i = 0; i < enchantmentCount; i++) {
+                uint16_t enchantmentId = (itemData[offset] << 8) | itemData[offset + 1]; offset += 2;
+                uint16_t enchantmentLevel = (itemData[offset] << 8) | itemData[offset + 1]; offset += 2;
+                CompoundTag* enchantmentTag = new CompoundTag();
+                enchantmentTag->putShort(ItemInstance::TAG_ENCH_ID, enchantmentId);
+                enchantmentTag->putShort(ItemInstance::TAG_ENCH_LEVEL, enchantmentLevel);
+                enchantmentTags->add(enchantmentTag);
+            }
+
+            item->tag->put(L"ench", enchantmentTags);
+        }
+
+        if (metadataFlags & 0x8) {
+            CompoundTag* compoundTag = new CompoundTag(L"fourkit-data");
+            int16_t length = (itemData[offset] << 8) | itemData[offset + 1]; offset += 2;
+
+            for (int i = 0; i < length; i++) {
+                Tag* tag = Transformation_ReadTagFromBuffer(itemData, offset);
+                if (tag != nullptr) {
+                    compoundTag->put(tag->getName(), tag);
+                }
+            }
+
+            item->tag->put(L"fourkit-data", compoundTag);
+        }
+
+    }
+}
+
+void Transformation_WriteItemToBuffer(std::shared_ptr<ItemInstance> item, unsigned char* outBuffer, int& offset) {
+    outBuffer[offset] = (item == nullptr); offset += 1;
+    
+    if (item != nullptr) {
+
+        int itemId = item->id;
+        int itemCount = item->count;
+        int aux = item->getAuxValue();
+
+        outBuffer[offset] = ((itemId >> 8) & 0xFF); offset += 1;
+        outBuffer[offset] = (itemId & 0xFF); offset += 1;
+
+        outBuffer[offset] = itemCount; offset += 1;
+
+        outBuffer[offset] = ((aux >> 8) & 0xFF); offset += 1;
+        outBuffer[offset] = (aux & 0xFF); offset += 1;
+
+        Transformation_WriteItemMetaToBuffer(item, outBuffer, offset);
+    }
+}
+
+ItemInstance* Transformation_ReadItemFromBuffer_CStyle(unsigned char* itemData, int& offset) {
+    unsigned char isItemNull = itemData[offset]; offset += 1;
+
+    if (isItemNull == 0) {
+        int itemId = (itemData[offset] << 8) | itemData[offset + 1]; offset += 2;
+        int itemCount = itemData[offset]; offset += 1;
+        int aux = (itemData[offset] << 8) | itemData[offset + 1]; offset += 2;
+
+        if (aux >= 65535) aux = -1; //for some reason -1 aux comes over as 65535, too lazy to fix
+
+        ItemInstance* item = new ItemInstance(itemId, itemCount, aux);
+        item->setAuxValue(aux); //allow plugins to do whatever they want with aux
+
+        Transformation_ReadItemMetaFromBuffer(item, itemData, offset);
+
+        return item;
+    }
+
+    return nullptr;
+}
+
+
+std::shared_ptr<ItemInstance> Transformation_ReadItemFromBuffer(unsigned char* itemData, int& offset) {
+    unsigned char isItemNull = itemData[offset]; offset += 1;
+
+    if (isItemNull == 0) {
+        int itemId = (itemData[offset] << 8) | itemData[offset + 1]; offset += 2;
+        int itemCount = itemData[offset]; offset += 1;
+        int aux = (itemData[offset] << 8) | itemData[offset + 1]; offset += 2;
+
+        if (aux >= 65535) aux = -1; //for some reason -1 aux comes over as 65535, too lazy to fix
+
+        std::shared_ptr<ItemInstance> item = std::make_shared<ItemInstance>(itemId, itemCount, aux);
+        item->setAuxValue(aux); //allow plugins to do whatever they want with aux
+
+        Transformation_ReadItemMetaFromBuffer(item.get(), itemData, offset);
+
+        return item;
+    }
+
+    return nullptr;
+}
+
+void Transformation_ReadItemFromBuffer(std::shared_ptr<ItemInstance> item, unsigned char* itemData, int& offset) {
+    unsigned char isItemNull = itemData[offset]; offset += 1;
+
+    if (isItemNull == 0) {
+        int itemId = (itemData[offset] << 8) | itemData[offset + 1]; offset += 2;
+        int itemCount = itemData[offset]; offset += 1;
+        int aux = (itemData[offset] << 8) | itemData[offset + 1]; offset += 2;
+
+        item->id = itemId;
+        item->count = itemCount;
+        item->setAuxValue(aux); //allow plugins to do whatever they want with aux
+
+        Transformation_ReadItemMetaFromBuffer(item.get(), itemData, offset);
+    }
+}
+
+void __cdecl NativeGetPlayerInventory(int entityId, unsigned char *outData)
+{
+    memset(outData, 0, (4*1024) * sizeof(unsigned char)); //todo: should we be clearing this every call?
+
+    auto player = FindPlayer(entityId);
+    if (!player || !player->inventory)
+        return;
+
+    unsigned int size = player->inventory->getContainerSize();
+    if (size > 40)
+        size = 40;
+
+    int offset = 0;
+    outData[offset] = player->inventory->selected; offset += 1;
+
+    for (int i = 0; i < size; i++)
+    {
+        Transformation_WriteItemToBuffer(player->inventory->getItem(i), outData, offset);
+    }
+}
+
+void __cdecl NativeSetPlayerInventorySlot(int entityId, int slot, unsigned char* itemData)
+{
+    auto player = FindPlayer(entityId);
+    if (IsHostPlayer(player)) return;
+    if (!player || !player->inventory)
+        return;
+
+    int offset = 0;
+    player->inventory->setItem(slot, Transformation_ReadItemFromBuffer(itemData, offset));
+}
+
+void __cdecl NativeGetContainerContents(int entityId, unsigned char *outData, int maxSlots)
+{
+    memset(outData, 0, (4*1024) * sizeof(unsigned char));
+
+    auto player = FindPlayer(entityId);
+    if (!player || !player->containerMenu || player->containerMenu == player->inventoryMenu)
+        return;
+
+    auto *menu = player->containerMenu;
+    auto *items = menu->getItems();
+    int count = (int)items->size();
+    if (count > maxSlots)
+        count = maxSlots;
+
+    int offset = 0;
+    for (int i = 0; i < count; i++)
+    {
+        Transformation_WriteItemToBuffer((*items)[i], outData, offset);
+    }
+    delete items;
+}
+
+void __cdecl NativeSetContainerSlot(int entityId, int slot, unsigned char* itemData)
+{
+    auto player = FindPlayer(entityId);
+    if (IsHostPlayer(player)) return;
+    if (!player || !player->containerMenu || player->containerMenu == player->inventoryMenu)
+        return;
+
+    auto *menu = player->containerMenu;
+    if (slot < 0 || slot >= (int)menu->slots.size())
+        return;
+
+    int offset = 0;
+    menu->setItem(slot, Transformation_ReadItemFromBuffer(itemData, offset));
+
+    menu->broadcastChanges();
+}
+
+void __cdecl NativeGetContainerViewerEntityIds(int entityId, int *outIds, int maxCount, int *outCount)
+{
+    *outCount = 0;
+
+    auto player = FindPlayer(entityId);
+    if (!player || !player->containerMenu || player->containerMenu == player->inventoryMenu)
+        return;
+
+    auto *menu = player->containerMenu;
+    if (menu->slots.empty())
+        return;
+
+    Container *myContainer = menu->slots[0]->container.get();
+    if (!myContainer)
+        return;
+
+    CompoundContainer *myCompound = dynamic_cast<CompoundContainer *>(myContainer);
+    if (myCompound)
+        myContainer = myCompound->getFirstContainer().get();
+
+    PlayerList *list = MinecraftServer::getPlayerList();
+    if (!list)
+        return;
+
+    int count = 0;
+    for (auto &p : list->players)
+    {
+        if (!p || !p->containerMenu || p->containerMenu == p->inventoryMenu)
+            continue;
+        if (p->containerMenu->slots.empty())
+            continue;
+        Container *theirContainer = p->containerMenu->slots[0]->container.get();
+        CompoundContainer *theirCompound = dynamic_cast<CompoundContainer *>(theirContainer);
+        if (theirCompound)
+            theirContainer = theirCompound->getFirstContainer().get();
+        if (theirContainer == myContainer && count < maxCount)
+            outIds[count++] = p->entityId;
+    }
+    *outCount = count;
+}
+
+void __cdecl NativeCloseContainer(int entityId)
+{
+    auto player = FindPlayer(entityId);
+    if (IsHostPlayer(player)) return;
+    if (player && player->containerMenu != player->inventoryMenu)
+        player->closeContainer();
+}
+
+void __cdecl NativeOpenVirtualContainer(int entityId, int nativeType, int slotCount, unsigned char *containerBuffer)
+{
+    auto player = FindPlayer(entityId);
+    if (IsHostPlayer(player)) return;
+    if (!player)
+        return;
+
+    if (player->containerMenu != player->inventoryMenu)
+        player->closeContainer();
+
+    int offset = 0;
+    short titleLength = ((containerBuffer[offset] << 8) | containerBuffer[offset + 1]); offset += 2;
+    wstring title = L"";
+    for (int i = 0; i < titleLength; i++) {
+        wchar_t c = (containerBuffer[offset] << 8) | containerBuffer[offset + 1]; offset += 2;
+        title.push_back(c);
+    }
+
+    auto container = std::make_shared<VirtualContainer>(nativeType, title, slotCount);
+    
+    for (int i = 0; i < slotCount; i++)
+    {
+        container->setItem(i, Transformation_ReadItemFromBuffer(containerBuffer, offset));
+    }
+
+    player->openContainer(container);
+}
+
+void __cdecl NativeSetHeldItemSlot(int entityId, int slot)
+{
+    auto player = FindPlayer(entityId);
+    if (IsHostPlayer(player)) return;
+    if (!player || !player->inventory) return;
+    if (slot < 0 || slot >= Inventory::getSelectionSize()) return;
+    player->inventory->selected = slot;
+    if (player->connection)
+        player->connection->queueSend(std::make_shared<SetCarriedItemPacket>(slot));
+}
+
+void __cdecl NativeGetCarriedItem(int entityId, int *outData)
+{
+    outData[0] = 0;
+    outData[1] = 0;
+    outData[2] = 0;
+    auto player = FindPlayer(entityId);
+    if (!player || !player->inventory)
+        return;
+    auto item = player->inventory->getCarried();
+    if (item)
+    {
+        outData[0] = item->id;
+        outData[1] = item->getAuxValue();
+        outData[2] = (int)item->count;
+    }
+}
+
+void __cdecl NativeSetCarriedItem(int entityId, int itemId, int count, int aux)
+{
+    auto player = FindPlayer(entityId);
+    if (IsHostPlayer(player)) return;
+    if (!player || !player->inventory)
+        return;
+    if (itemId <= 0 || count <= 0)
+        player->inventory->setCarried(nullptr);
+    else
+        player->inventory->setCarried(std::make_shared<ItemInstance>(itemId, count, aux));
+}
+
+void __cdecl NativeGetEnderChestContents(int entityId, int *outData)
+{
+    memset(outData, 0, 27 * 3 * sizeof(int));
+    auto player = FindPlayer(entityId);
+    if (!player)
+        return;
+    auto ec = player->getEnderChestInventory();
+    if (!ec)
+        return;
+    unsigned int size = ec->getContainerSize();
+    if (size > 27)
+        size = 27;
+    for (unsigned int i = 0; i < size; i++)
+    {
+        //WriteInventoryItemData(ec->getItem(i), i, outData);
+    }
+}
+
+void __cdecl NativeSetEnderChestSlot(int entityId, int slot, int itemId, int count, int aux)
+{
+    auto player = FindPlayer(entityId);
+    if (IsHostPlayer(player)) return;
+    if (!player)
+        return;
+    auto ec = player->getEnderChestInventory();
+    if (!ec)
+        return;
+    if (slot < 0 || slot >= (int)ec->getContainerSize())
+        return;
+    if (itemId <= 0 || count <= 0)
+        ec->setItem(slot, nullptr);
+    else
+        ec->setItem(slot, std::make_shared<ItemInstance>(itemId, count, aux));
+}
+
+void __cdecl NativeSetSneaking(int entityId, int sneak)
+{
+    auto player = FindPlayer(entityId);
+    if (IsHostPlayer(player)) return;
+    if (player)
+        player->setSneaking(sneak != 0);
+}
+
+void __cdecl NativeSetVelocity(int entityId, double x, double y, double z)
+{
+    auto player = FindPlayer(entityId);
+    if (IsHostPlayer(player)) return;
+    if (player)
+    {
+        player->xd = x;
+        player->yd = y;
+        player->zd = z;
+        player->hurtMarked = true;
+        return;
+    }
+    auto entity = FindEntity(entityId);
+    if (entity)
+    {
+        entity->xd = x;
+        entity->yd = y;
+        entity->zd = z;
+        entity->hurtMarked = true;
+    }
+}
+
+void __cdecl NativeSetAllowFlight(int entityId, int allowFlight)
+{
+    auto player = FindPlayer(entityId);
+    if (IsHostPlayer(player)) return;
+    if (player)
+    {
+        player->abilities.mayfly = (allowFlight != 0);
+        if (!player->abilities.mayfly)
+            player->abilities.flying = false;
+        if (player->connection)
+            player->connection->send(std::make_shared<PlayerAbilitiesPacket>(&player->abilities));
+    }
+}
+
+void __cdecl NativePlaySound(int entityId, int soundId, double x, double y, double z, float volume, float pitch)
+{
+    auto player = FindPlayer(entityId);
+    if (IsHostPlayer(player)) return;
+    if (player && player->connection)
+        player->connection->send(std::make_shared<LevelSoundPacket>(soundId, x, y, z, volume, pitch));
+}
+
+void __cdecl NativeSetSleepingIgnored(int entityId, int ignored)
+{
+    auto player = FindPlayer(entityId);
+    if (IsHostPlayer(player)) return;
+    if (player)
+        player->fk_sleepingIgnored = (ignored != 0);
+}
+
+void __cdecl NativeSetLevel(int entityId, int level)
+{
+    auto player = FindPlayer(entityId);
+    if (IsHostPlayer(player)) return;
+    if (!player) return;
+    player->experienceLevel = level;
+    if (player->connection)
+        player->connection->send(std::make_shared<SetExperiencePacket>(player->experienceProgress, player->totalExperience, player->experienceLevel));
+}
+
+void __cdecl NativeSetExp(int entityId, float exp)
+{
+    auto player = FindPlayer(entityId);
+    if (IsHostPlayer(player)) return;
+    if (!player) return;
+    player->experienceProgress = exp;
+    if (player->connection)
+        player->connection->send(std::make_shared<SetExperiencePacket>(player->experienceProgress, player->totalExperience, player->experienceLevel));
+}
+
+void __cdecl NativeGiveExp(int entityId, int amount)
+{
+    auto player = FindPlayer(entityId);
+    if (IsHostPlayer(player)) return;
+    if (!player) return;
+    player->increaseXp(amount);
+    if (player->connection)
+        player->connection->send(std::make_shared<SetExperiencePacket>(player->experienceProgress, player->totalExperience, player->experienceLevel));
+}
+
+void __cdecl NativeGiveExpLevels(int entityId, int amount)
+{
+    auto player = FindPlayer(entityId);
+    if (IsHostPlayer(player)) return;
+    if (!player) return;
+    player->giveExperienceLevels(amount);
+    if (player->connection)
+        player->connection->send(std::make_shared<SetExperiencePacket>(player->experienceProgress, player->totalExperience, player->experienceLevel));
+}
+
+void __cdecl NativeSetFoodLevel(int entityId, int foodLevel)
+{
+    auto player = FindPlayer(entityId);
+    if (IsHostPlayer(player)) return;
+    if (!player) return;
+    FoodData *fd = player->getFoodData();
+    if (!fd) return;
+    fd->setFoodLevel(foodLevel);
+    if (player->connection)
+        player->connection->send(std::make_shared<SetHealthPacket>(player->getHealth(), fd->getFoodLevel(), fd->getSaturationLevel(), eTelemetryChallenges_Unknown));
+}
+
+void __cdecl NativeSetSaturation(int entityId, float saturation)
+{
+    auto player = FindPlayer(entityId);
+    if (IsHostPlayer(player)) return;
+    if (!player) return;
+    FoodData *fd = player->getFoodData();
+    if (!fd) return;
+    fd->setSaturation(saturation);
+    if (player->connection)
+        player->connection->send(std::make_shared<SetHealthPacket>(player->getHealth(), fd->getFoodLevel(), fd->getSaturationLevel(), eTelemetryChallenges_Unknown));
+}
+
+void __cdecl NativeSetExhaustion(int entityId, float exhaustion)
+{
+    auto player = FindPlayer(entityId);
+    if (IsHostPlayer(player)) return;
+    if (!player) return;
+    FoodData *fd = player->getFoodData();
+    if (!fd) return;
+    fd->setExhaustion(exhaustion);
+}
+
+void __cdecl NativeSpawnParticle(int entityId, int particleId, float x, float y, float z, float offsetX, float offsetY, float offsetZ, float speed, int count)
+{
+    auto player = FindPlayer(entityId);
+    if (IsHostPlayer(player)) return;
+    if (!player || !player->connection) return;
+    wchar_t buf[32];
+    swprintf_s(buf, L"%d", particleId);
+    player->connection->send(std::make_shared<LevelParticlesPacket>(std::wstring(buf), x, y, z, offsetX, offsetY, offsetZ, speed, count));
+}
+
+int __cdecl NativeSetPassenger(int entityId, int passengerEntityId)
+{
+    auto hostEntity = FindPlayer(entityId);
+    if (IsHostPlayer(hostEntity)) return 0;
+    auto hostPassenger = FindPlayer(passengerEntityId);
+    if (IsHostPlayer(hostPassenger)) return 0;
+    auto entity = FindEntity(entityId);
+    auto passenger = FindEntity(passengerEntityId);
+    if (!entity || !passenger) return 0;
+    passenger->ride(entity);
+    PlayerList *list = MinecraftServer::getPlayerList();
+    if (list)
+        list->broadcastAll(std::make_shared<SetEntityLinkPacket>(SetEntityLinkPacket::RIDING, passenger, entity), entity->dimension);
+    return 1;
+}
+
+int __cdecl NativeLeaveVehicle(int entityId)
+{
+    auto hostPlayer = FindPlayer(entityId);
+    if (IsHostPlayer(hostPlayer)) return 0;
+    auto entity = FindEntity(entityId);
+    if (!entity || !entity->riding) return 0;
+    int dim = entity->riding->dimension;
+    entity->ride(nullptr);
+    PlayerList *list = MinecraftServer::getPlayerList();
+    if (list)
+        list->broadcastAll(std::make_shared<SetEntityLinkPacket>(SetEntityLinkPacket::RIDING, entity, nullptr), dim);
+    return 1;
+}
+
+int __cdecl NativeEject(int entityId)
+{
+    auto hostEntity = FindPlayer(entityId);
+    if (IsHostPlayer(hostEntity)) return 0;
+    auto entity = FindEntity(entityId);
+    if (!entity) return 0;
+    auto riderPtr = entity->rider.lock();
+    if (!riderPtr) return 0;
+    auto riderAsPlayer = std::dynamic_pointer_cast<ServerPlayer>(riderPtr);
+    if (IsHostPlayer(riderAsPlayer)) return 0;
+    riderPtr->ride(nullptr);
+    PlayerList *list = MinecraftServer::getPlayerList();
+    if (list)
+        list->broadcastAll(std::make_shared<SetEntityLinkPacket>(SetEntityLinkPacket::RIDING, riderPtr, nullptr), entity->dimension);
+    return 1;
+}
+
+int __cdecl NativeGetVehicleId(int entityId)
+{
+    auto entity = FindEntity(entityId);
+    if (!entity || !entity->riding) return -1;
+    return entity->riding->entityId;
+}
+
+int __cdecl NativeGetPassengerId(int entityId)
+{
+    auto entity = FindEntity(entityId);
+    if (!entity) return -1;
+    auto riderPtr = entity->rider.lock();
+    if (!riderPtr) return -1;
+    return riderPtr->entityId;
+}
+
+void __cdecl NativeGetEntityInfo(int entityId, double *outData)
+{
+    outData[0] = -1;
+    outData[1] = 0;
+    outData[2] = 0;
+    outData[3] = 0;
+    outData[4] = 0;
+    auto entity = FindEntity(entityId);
+    if (!entity) return;
+    outData[0] = (double)MapEntityType((int)entity->GetType());
+    outData[1] = entity->x;
+    outData[2] = entity->y;
+    outData[3] = entity->z;
+    outData[4] = (double)entity->dimension;
+}
+
+int __cdecl NativeGetWorldEntities(int dimId, int **outBuf)
+{
+    *outBuf = nullptr;
+    ServerLevel *level = GetLevel(dimId);
+    if (!level)
+        return 0;
+
+    EnterCriticalSection(&level->m_entitiesCS);
+    int total = (int)level->entities.size();
+    int *buf = (int *)CoTaskMemAlloc(total * 3 * sizeof(int));
+    int count = 0;
+    if (buf)
+    {
+        for (auto &entity : level->entities)
+        {
+            if (!entity)
+                continue;
+            int idx = count * 3;
+            buf[idx] = entity->entityId;
+            buf[idx + 1] = MapEntityType((int)entity->GetType());
+            buf[idx + 2] = entity->instanceof(eTYPE_LIVINGENTITY) ? 1 : 0;
+            count++;
+        }
+    }
+    LeaveCriticalSection(&level->m_entitiesCS);
+    *outBuf = buf;
+    return count;
+}
+
+int __cdecl NativeGetChunkEntities(int dimId, int chunkX, int chunkZ, int **outBuf)
+{
+    *outBuf = nullptr;
+    ServerLevel *level = GetLevel(dimId);
+    if (!level)
+        return 0;
+
+    EnterCriticalSection(&level->m_entitiesCS);
+    int total = (int)level->entities.size();
+    int *buf = (int *)CoTaskMemAlloc(total * 3 * sizeof(int));
+    int count = 0;
+    if (buf)
+    {
+        for (auto &entity : level->entities)
+        {
+            if (!entity)
+                continue;
+            int ecx = Mth::floor(entity->x / 16.0);
+            int ecz = Mth::floor(entity->z / 16.0);
+            if (ecx != chunkX || ecz != chunkZ)
+                continue;
+            int idx = count * 3;
+            buf[idx] = entity->entityId;
+            buf[idx + 1] = MapEntityType((int)entity->GetType());
+            buf[idx + 2] = entity->instanceof(eTYPE_LIVINGENTITY) ? 1 : 0;
+            count++;
+        }
+    }
+    LeaveCriticalSection(&level->m_entitiesCS);
+    *outBuf = buf;
+    return count;
+}
+
+int __cdecl NativeIsChunkLoaded(int dimId, int chunkX, int chunkZ)
+{
+    ServerLevel *level = GetLevel(dimId);
+    if (!level || !level->cache)
+        return 0;
+    return level->cache->hasChunk(chunkX, chunkZ) ? 1 : 0;
+}
+
+int __cdecl NativeLoadChunk(int dimId, int chunkX, int chunkZ, int generate)
+{
+    ServerLevel *level = GetLevel(dimId);
+    if (!level || !level->cache)
+        return 0;
+    LevelChunk *chunk = level->cache->create(chunkX, chunkZ);
+    return (chunk != nullptr) ? 1 : 0;
+}
+
+int __cdecl NativeUnloadChunk(int dimId, int chunkX, int chunkZ, int save, int safe)
+{
+    ServerLevel *level = GetLevel(dimId);
+    if (!level || !level->cache)
+        return 0;
+    if (safe)
+    {
+        if (!level->cache->hasChunk(chunkX, chunkZ))
+            return 0;
+        LevelChunk *chunk = level->cache->getChunk(chunkX, chunkZ);
+        if (chunk && chunk->containsPlayer())
+            return 0;
+    }
+    level->cache->drop(chunkX, chunkZ);
+    return 1;
+}
+
+int __cdecl NativeGetLoadedChunks(int dimId, int **coordBuf)
+{
+    // wow gay
+    *coordBuf = nullptr;
+    ServerLevel *level = GetLevel(dimId);
+    if (!level || !level->cache)
+        return 0;
+
+    std::vector<LevelChunk *> *list = level->cache->getLoadedChunkList();
+
+    if (!list)
+        return 0;
+
+
+
+    int total = (int)list->size();
+    int *buf = (int *)CoTaskMemAlloc(total * 2 * sizeof(int));
+    int count = 0;
+
+    if (buf)
+    {
+        for (auto *chunk : *list)
+        {
+            if (chunk)
+            {
+                buf[count * 2] = chunk->x;
+                buf[count * 2 + 1] = chunk->z;
+                count++;
+            }
+        }
+    }
+
+    *coordBuf = buf;
+    return count;
+}
+
+int __cdecl NativeIsChunkInUse(int dimId, int chunkX, int chunkZ)
+{
+    PlayerList *list = MinecraftServer::getPlayerList();
+    if (!list)
+        return 0;
+    for (auto &p : list->players)
+    {
+        if (p && p->dimension == dimId)
+        {
+            int px = (int)floor(p->x) >> 4;
+            int pz = (int)floor(p->z) >> 4;
+            if (px == chunkX && pz == chunkZ)
+                return 1;
+        }
+    }
+    return 0;
+}
+
+void __cdecl NativeGetChunkSnapshot(int dimId, int chunkX, int chunkZ, int *blockIds, int *blockData, int *maxBlockY)
+{
+    ServerLevel *level = GetLevel(dimId);
+    if (!level || !level->cache)
+    {
+        memset(blockIds, 0, 16 * 128 * 16 * sizeof(int));
+        memset(blockData, 0, 16 * 128 * 16 * sizeof(int));
+        memset(maxBlockY, 0, 16 * 16 * sizeof(int));
+        return;
+    }
+    if (!level->cache->hasChunk(chunkX, chunkZ))
+    {
+        memset(blockIds, 0, 16 * 128 * 16 * sizeof(int));
+        memset(blockData, 0, 16 * 128 * 16 * sizeof(int));
+        memset(maxBlockY, 0, 16 * 16 * sizeof(int));
+        return;
+    }
+    LevelChunk *chunk = level->cache->getChunk(chunkX, chunkZ);
+    if (!chunk)
+    {
+        memset(blockIds, 0, 16 * 128 * 16 * sizeof(int));
+        memset(blockData, 0, 16 * 128 * 16 * sizeof(int));
+        memset(maxBlockY, 0, 16 * 16 * sizeof(int));
+        return;
+    }
+    for (int lx = 0; lx < 16; lx++)
+    {
+        for (int lz = 0; lz < 16; lz++)
+        {
+            int highest = 0;
+            for (int ly = 0; ly < 128; ly++)
+            {
+                int idx = (lx * 128 * 16) + (ly * 16) + lz;
+                blockIds[idx] = chunk->getTile(lx, ly, lz);
+                blockData[idx] = chunk->getData(lx, ly, lz);
+                if (blockIds[idx] != 0)
+                    highest = ly;
+            }
+            maxBlockY[lx * 16 + lz] = highest;
+        }
+    }
+}
+
+int __cdecl NativeUnloadChunkRequest(int dimId, int chunkX, int chunkZ, int safe)
+{
+    ServerLevel *level = GetLevel(dimId);
+    if (!level || !level->cache)
+        return 0;
+    if (safe)
+    {
+        if (!level->cache->hasChunk(chunkX, chunkZ))
+            return 0;
+        LevelChunk *chunk = level->cache->getChunk(chunkX, chunkZ);
+        if (chunk && chunk->containsPlayer())
+            return 0;
+    }
+    level->cache->drop(chunkX, chunkZ);
+    return 1;
+}
+
+int __cdecl NativeRegenerateChunk(int dimId, int chunkX, int chunkZ)
+{
+    ServerLevel *level = GetLevel(dimId);
+    if (!level || !level->cache)
+        return 0;
+    level->cache->regenerateChunk(chunkX, chunkZ);
+    return 1;
+}
+
+int __cdecl NativeRefreshChunk(int dimId, int chunkX, int chunkZ)
+{
+    ServerLevel *level = GetLevel(dimId);
+    if (!level)
+        return 0;
+
+    PlayerList *list = MinecraftServer::getPlayerList();
+    if (!list)
+        return 0;
+
+    auto packet = std::make_shared<BlockRegionUpdatePacket>(chunkX * 16, 0, chunkZ * 16, 16, Level::maxBuildHeight, 16, level);
+    for (auto &p : list->players)
+    {
+        if (!p || p->dimension != dimId || !p->connection || p->connection->isLocal())
+            continue;
+        p->connection->send(packet);
+    }
+    return 1;
+}
+
+int __cdecl NativeGetSkyLight(int dimId, int x, int y, int z)
+{
+    ServerLevel *level = GetLevel(dimId);
+    if (!level)
+        return 0;
+    return level->getBrightness(LightLayer::Sky, x, y, z);
+}
+
+int __cdecl NativeGetBlockLight(int dimId, int x, int y, int z)
+{
+    ServerLevel *level = GetLevel(dimId);
+    if (!level)
+        return 0;
+    return level->getBrightness(LightLayer::Block, x, y, z);
+}
+
+int __cdecl NativeGetBiomeId(int dimId, int x, int z)
+{
+    ServerLevel *level = GetLevel(dimId);
+    if (!level)
+        return 1;
+    Biome *biome = level->getBiome(x, z);
+    return biome ? biome->id : 1;
+}
+
+void __cdecl NativeSetBiomeId(int dimId, int x, int z, int biomeId)
+{
+    ServerLevel *level = GetLevel(dimId);
+    if (!level)
+        return;
+    LevelChunk *chunk = level->getChunk(x >> 4, z >> 4);
+    if (!chunk)
+        return;
+    byteArray biomes = chunk->getBiomes();
+    if (biomes.data == nullptr)
+        return;
+    int lx = x & 0xf;
+    int lz = z & 0xf;
+    biomes.data[(lz << 4) | lx] = static_cast<unsigned char>(biomeId & 0xff);
+}
+
+} // namespace FourKitBridge
