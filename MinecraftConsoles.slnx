@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Solution>
+  <Project Name="Minecraft.World" Path="Minecraft.World\CMakeLists.txt" />
+  <Project Name="Minecraft.Client" Path="Minecraft.Client\CMakeLists.txt" />
+</Solution>

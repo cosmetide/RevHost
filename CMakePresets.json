@@ -1,0 +1,27 @@
+{
+  "version": 5,
+  "configurePresets": [
+    {
+      "name": "base",
+      "generator": "Ninja Multi-Config",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "hidden": true
+    },
+    {
+      "name": "windows64",
+      "displayName": "Windows64",
+      "inherits": "base",
+      "cacheVariables": {
+        "PLATFORM_DEFINES": "_WINDOWS64",
+        "PLATFORM_NAME": "Windows64",
+        "IGGY_LIBS": "iggy_w64.lib",
+        "CMAKE_C_FLAGS_DEBUG": "/MDd /Z7 /Ob0 /Od /RTC1",
+        "CMAKE_CXX_FLAGS_DEBUG": "/MDd /Z7 /Ob0 /Od /RTC1"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "windows64-debug",   "displayName": "Windows64 - Debug",   "configurePreset": "windows64", "configuration": "Debug" },
+    { "name": "windows64-release", "displayName": "Windows64 - Release", "configurePreset": "windows64", "configuration": "Release" }
+  ]
+}
