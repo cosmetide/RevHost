@@ -1,0 +1,45 @@
+namespace Minecraft.Server.FourKit;
+
+/// <summary>
+/// Enum of particle effects that can be spawned for a player.
+/// </summary>
+public enum Particle
+{
+    WATER_BUBBLE = 0,
+    SMOKE_NORMAL = 1,
+    NOTE = 2,
+    PORTAL = 3,
+    EXPLOSION_NORMAL = 5,
+    FLAME = 6,
+    LAVA = 7,
+    FOOTSTEP = 8,
+    WATER_SPLASH = 9,
+    SMOKE_LARGE = 10,
+    REDSTONE = 11,
+    SNOWBALL = 12,
+    SNOW_SHOVEL = 13,
+    SLIME = 14,
+    HEART = 15,
+    SUSPENDED = 16,
+    SUSPENDED_DEPTH = 17,
+    CRIT = 18,
+    EXPLOSION_HUGE = 19,
+    EXPLOSION_LARGE = 20,
+    TOWN_AURA = 21,
+    SPELL = 22,
+    SPELL_WITCH = 23,
+    SPELL_MOB = 24,
+    SPELL_MOB_AMBIENT = 25,
+    SPELL_INSTANT = 26,
+    CRIT_MAGIC = 27,
+    DRIP_WATER = 28,
+    DRIP_LAVA = 29,
+    ENCHANTMENT_TABLE = 30,
+    DRAGON_BREATH = 31,
+    END_ROD = 32,
+    VILLAGER_ANGRY = 33,
+    VILLAGER_HAPPY = 34,
+    FIREWORKS_SPARK = 35,
+    ITEM_CRACK = 0x100000,
+    BLOCK_CRACK = 0x200000,
+}

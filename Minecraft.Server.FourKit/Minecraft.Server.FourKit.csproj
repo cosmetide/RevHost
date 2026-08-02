@@ -1,0 +1,13 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>Minecraft.Server.FourKit</RootNamespace>
+    <AssemblyName>Minecraft.Server.FourKit</AssemblyName>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+    <BaseOutputPath>bin</BaseOutputPath>
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
+  </PropertyGroup>
+</Project>

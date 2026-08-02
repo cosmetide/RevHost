@@ -1,0 +1,30 @@
+﻿using Minecraft.Server.FourKit.Inventory;
+
+namespace Minecraft.Server.FourKit.Enchantments;
+
+public class ThornsEnchantment : Enchantment
+{
+    static readonly Material[] supportedItems = {
+        Material.LEATHER_HELMET,   Material.LEATHER_CHESTPLATE,   Material.LEATHER_LEGGINGS,   Material.LEATHER_BOOTS,
+        Material.CHAINMAIL_HELMET, Material.CHAINMAIL_CHESTPLATE, Material.CHAINMAIL_LEGGINGS, Material.CHAINMAIL_BOOTS,
+        Material.GOLD_HELMET,      Material.GOLD_CHESTPLATE,      Material.GOLD_LEGGINGS,      Material.GOLD_BOOTS,
+        Material.IRON_HELMET,      Material.IRON_CHESTPLATE,      Material.IRON_LEGGINGS,      Material.IRON_BOOTS,
+        Material.DIAMOND_HELMET,   Material.DIAMOND_CHESTPLATE,   Material.DIAMOND_LEGGINGS,   Material.DIAMOND_BOOTS,
+    };
+
+    static readonly EnchantmentType[] conflictedEnchants = { };
+
+    public override bool canEnchantItem(ItemStack item) => supportedItems.Contains(item.getType());
+
+    public override bool conflictsWith(Enchantment other) => conflictedEnchants.Contains(other.getEnchantType());
+
+    public override EnchantmentTarget getItemTarget() => EnchantmentTarget.ARMOR;
+
+    public override EnchantmentType getEnchantType() => EnchantmentType.THORNS;
+
+    public override int getMaxLevel() => 3;
+
+    public override string getName() => "thorns";
+
+    public override int getStartLevel() => 1;
+}
