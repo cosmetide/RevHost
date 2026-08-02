@@ -446,7 +446,9 @@ void PendingConnection::handleLogin(shared_ptr<LoginPacket> packet)
 
 	bool whitelistSatisfied = true;
 #if defined(_WINDOWS64) && defined(MINECRAFT_SERVER_BUILD)
-	if (ServerRuntime::Access::IsWhitelistEnabled())
+	// The local host / server itself always passes the whitelist.
+	const bool isLocalHost = connection != nullptr && connection->getSocket() != nullptr && connection->getSocket()->isLocal();
+	if (!isLocalHost && ServerRuntime::Access::IsWhitelistEnabled())
 	{
 		whitelistSatisfied = false;
 		if (loginXuid != INVALID_XUID)

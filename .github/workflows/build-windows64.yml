@@ -44,8 +44,13 @@ jobs:
         shell: pwsh
         run: |
           $src = "build/windows64/Minecraft.Client/Release"
+          $stage = Join-Path $env:RUNNER_TEMP "revhost-stage"
+          Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
+          $exclude = "minecraft.revhost.pdb minecraft.revhost.ipdb minecraft.revhost.lib minecraft.revhost.iobj minecraft.revhost.exp"
+          robocopy $src $stage /E /XF $exclude.Split(" ") | Out-Null
+          if ($LASTEXITCODE -ge 8) { throw "robocopy failed with exit code $LASTEXITCODE" }
           $zip = "revhost-windows64-nightly.zip"
-          Compress-Archive -Path "$src/*" -DestinationPath $zip -Force
+          Compress-Archive -Path "$stage/*" -DestinationPath $zip -Force
           Write-Host "Created $zip ($([math]::Round((Get-Item $zip).Length / 1MB, 1)) MB)"
 
       - name: Publish / overwrite nightly release
