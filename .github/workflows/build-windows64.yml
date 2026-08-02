@@ -1,0 +1,64 @@
+name: Build RevHost Nightly
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows64:
+    runs-on: windows-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Set up MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure CMake
+        run: cmake --preset windows64
+
+      - name: Build (Release)
+        run: cmake --build --preset windows64-release
+
+      - name: Verify output
+        shell: pwsh
+        run: |
+          $exe = "build/windows64/Minecraft.Client/Release/minecraft.revhost.exe"
+          if (-not (Test-Path $exe)) { Write-Error "Build output not found: $exe"; exit 1 }
+          Write-Host "Built: $exe"
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          $src = "build/windows64/Minecraft.Client/Release"
+          $zip = "revhost-windows64-nightly.zip"
+          Compress-Archive -Path "$src/*" -DestinationPath $zip -Force
+          Write-Host "Created $zip ($([math]::Round((Get-Item $zip).Length / 1MB, 1)) MB)"
+
+      - name: Publish / overwrite nightly release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          gh release view nightly 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release delete nightly --yes --cleanup-tag
+          }
+          gh release create nightly revhost-windows64-nightly.zip `
+            --title "RevHost Nightly" `
+            --notes "Automated nightly build of main (commit ${{ github.sha }})."
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
